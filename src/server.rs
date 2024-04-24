@@ -83,10 +83,9 @@ impl ServerInstance {
         }
     }
 
-    pub fn cli_admin(&self) -> process::Command {
+    pub fn cli(&self) -> process::Command {
         let mut cmd = process::Command::new("edgedb");
         cmd.arg("--no-cli-update-check");
-        cmd.arg("--admin");
         cmd.arg("--unix-path").arg(&self.info.socket_dir);
         cmd.arg("--port").arg(self.info.port.to_string());
         cmd.env("CLICOLOR", "0");
@@ -137,7 +136,7 @@ impl ServerInstance {
 
         // migration create
         assert!(self
-            .cli_admin()
+            .cli()
             .arg("migration")
             .arg("create")
             .arg("--schema-dir")
@@ -149,7 +148,7 @@ impl ServerInstance {
 
         // migration apply
         assert!(self
-            .cli_admin()
+            .cli()
             .arg("migration")
             .arg("apply")
             .arg("--schema-dir")
