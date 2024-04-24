@@ -2,16 +2,14 @@ use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::os::fd::OwnedFd;
+use std::path::Path;
 use std::process;
 use std::sync::Mutex;
 
 use anyhow::Context;
 use command_fds::{CommandFdExt, FdMapping};
-use once_cell::sync::Lazy;
 
-pub static SERVER: Lazy<ServerGuard> = Lazy::new(ServerGuard::start);
-
-pub struct ServerGuard {
+pub struct ServerInstance {
     pub info: ServerInfo,
     pub version_major: u8,
     process: Mutex<Option<process::Child>>,
@@ -28,8 +26,8 @@ pub struct ServerInfo {
     pub listen_addrs: Vec<(String, u16)>,
 }
 
-impl ServerGuard {
-    pub fn start() -> ServerGuard {
+impl ServerInstance {
+    pub fn start() -> ServerInstance {
         let bin_name = if let Ok(ver) = env::var("EDGEDB_MAJOR_VERSION") {
             format!("edgedb-server-{}", ver)
         } else {
@@ -71,8 +69,6 @@ impl ServerGuard {
             .spawn()
             .unwrap_or_else(|_| panic!("Can run {}", bin_name));
 
-        shutdown_hooks::add_shutdown_hook(stop_server);
-
         // write log file
         let stdout = process.stderr.take().unwrap();
         std::thread::spawn(move || write_log_into_file(stdout));
@@ -80,14 +76,14 @@ impl ServerGuard {
         // wait for server to start
         let info = wait_for_server_status(status_read).unwrap();
 
-        ServerGuard {
+        ServerInstance {
             info,
             version_major,
             process: Mutex::new(Some(process)),
         }
     }
 
-    pub fn cli_admin(&self) -> process::Command {       
+    pub fn cli_admin(&self) -> process::Command {
         let mut cmd = process::Command::new("edgedb");
         cmd.arg("--no-cli-update-check");
         cmd.arg("--admin");
@@ -97,7 +93,7 @@ impl ServerGuard {
         cmd
     }
 
-    fn stop(&self) {
+    pub fn stop(&self) {
         use nix::sys::signal;
         use nix::unistd::Pid;
 
@@ -116,10 +112,52 @@ impl ServerGuard {
 
         eprintln!("Stopped.");
     }
-}
 
-extern "C" fn stop_server() {
-    SERVER.stop();
+    pub fn apply_schema(&self, schema_dir: &Path) {
+        let schema_dir = schema_dir.canonicalize().unwrap();
+
+        eprintln!("Applying schema in {schema_dir:?}");
+
+        // copy schema dir to tmp so we don't pollute the committed dir
+        let mut tmp_schema_dir = std::env::temp_dir();
+        let millis_since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis();
+        tmp_schema_dir.push(format!("edgedb-dbschema-{millis_since_epoch}"));
+        std::fs::create_dir(&tmp_schema_dir).unwrap();
+        fs_extra::dir::copy(
+            schema_dir,
+            &tmp_schema_dir,
+            &fs_extra::dir::CopyOptions::new()
+                .overwrite(true)
+                .content_only(true),
+        )
+        .expect("cannot copy schema to a tmp dir");
+
+        // migration create
+        assert!(self
+            .cli_admin()
+            .arg("migration")
+            .arg("create")
+            .arg("--schema-dir")
+            .arg(&tmp_schema_dir)
+            .arg("--non-interactive")
+            .status()
+            .expect("cannot run edgedb-cli to create a migration")
+            .success());
+
+        // migration apply
+        assert!(self
+            .cli_admin()
+            .arg("migration")
+            .arg("apply")
+            .arg("--schema-dir")
+            .arg(&tmp_schema_dir)
+            .status()
+            .expect("cannot run edgedb-cli to apply a migration")
+            .success());
+    }
 }
 
 fn get_edgedb_server_version(bin_name: &str) -> u8 {
@@ -127,7 +165,10 @@ fn get_edgedb_server_version(bin_name: &str) -> u8 {
     cmd.arg("--version");
     cmd.stdout(process::Stdio::piped());
 
-    let mut process = cmd.spawn().with_context(|| format!("Cannot run executable {bin_name}")).unwrap();
+    let mut process = cmd
+        .spawn()
+        .with_context(|| format!("Cannot run executable {bin_name}"))
+        .unwrap();
     let server_stdout = process.stdout.take().expect("stdout is pipe");
     let buf = BufReader::new(server_stdout);
 
@@ -181,13 +222,13 @@ fn wait_for_server_status(status_read: OwnedFd) -> anyhow::Result<ServerInfo> {
 fn write_log_into_file(stream: impl std::io::Read) {
     let log_dir = env::temp_dir();
 
-    let time_the_epoch = std::time::SystemTime::now()
+    let millis_since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .expect("Time went backwards")
         .as_millis();
 
     let mut log_file = log_dir.clone();
-    let file_name = format!("edgedb-server-{time_the_epoch}.log").to_string();
+    let file_name = format!("edgedb-server-{millis_since_epoch}.log").to_string();
     log_file.push(file_name);
 
     eprintln!("Writing server logs into {:?}", &log_file);
