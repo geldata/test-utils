@@ -23,7 +23,7 @@ fn test_01() {
     assert!(SERVER.info.port > 1000);
 
     assert!(SERVER
-        .cli_admin()
+        .cli()
         .arg("query")
         .arg("--output-format=tab-separated")
         .arg("SELECT sys::get_current_database()")

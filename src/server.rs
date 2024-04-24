@@ -23,7 +23,6 @@ pub struct ServerInfo {
     pub tls_cert_file: String,
     pub tls_cert_newly_generated: bool,
     pub jws_keys_newly_generated: bool,
-    pub listen_addrs: Vec<(String, u16)>,
 }
 
 impl ServerInstance {
@@ -93,18 +92,30 @@ impl ServerInstance {
     }
 
     pub fn stop(&self) {
-        use nix::sys::signal;
-        use nix::unistd::Pid;
-
         let Some(mut process) = self.process.lock().unwrap().take() else {
             return;
         };
 
         eprintln!("Stopping...");
 
-        let pid = Pid::from_raw(process.id() as i32);
-        if let Err(e) = signal::kill(pid, signal::Signal::SIGTERM) {
-            eprintln!("could not send SIGTERM to edgedb-server: {:?}", e);
+        #[cfg(not(windows))]
+        {
+            use nix::sys::signal::{self, Signal};
+            use nix::unistd::Pid;
+
+            let pid = Pid::from_raw(process.id() as i32);
+            if let Err(e) = signal::kill(pid, Signal::SIGTERM) {
+                eprintln!("could not send SIGTERM to edgedb-server: {:?}", e);
+            };
+        }
+
+        #[cfg(windows)]
+        {
+            // This is suboptimal -- ideally we need to close the process
+            // gracefully on Windows too.
+            if let Err(e) = proc.stop() {
+                eprintln!("could not kill edgedb-server: {:?}", e);
+            }
         }
 
         process.wait().ok();
@@ -143,7 +154,7 @@ impl ServerInstance {
             .arg(&tmp_schema_dir)
             .arg("--non-interactive")
             .status()
-            .expect("cannot run edgedb-cli to create a migration")
+            .expect("cannot run `edgedb` CLI to create a migration")
             .success());
 
         // migration apply
@@ -154,7 +165,7 @@ impl ServerInstance {
             .arg("--schema-dir")
             .arg(&tmp_schema_dir)
             .status()
-            .expect("cannot run edgedb-cli to apply a migration")
+            .expect("cannot run `edgedb` CLI to apply a migration")
             .success());
     }
 }
