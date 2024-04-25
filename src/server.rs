@@ -9,6 +9,8 @@ use std::sync::Mutex;
 use anyhow::Context;
 use command_fds::{CommandFdExt, FdMapping};
 
+use crate::cmd_execute::DebugCommand;
+
 pub struct ServerInstance {
     pub info: ServerInfo,
     pub version_major: u8,
@@ -146,27 +148,21 @@ impl ServerInstance {
         .expect("cannot copy schema to a tmp dir");
 
         // migration create
-        assert!(self
-            .cli()
+        self.cli()
             .arg("migration")
             .arg("create")
             .arg("--schema-dir")
             .arg(&tmp_schema_dir)
             .arg("--non-interactive")
-            .status()
-            .expect("cannot run `edgedb` CLI to create a migration")
-            .success());
+            .execute_and_print_errors(Some("edgedb CLI"), "create a migration");
 
         // migration apply
-        assert!(self
-            .cli()
+        self.cli()
             .arg("migration")
             .arg("apply")
             .arg("--schema-dir")
             .arg(&tmp_schema_dir)
-            .status()
-            .expect("cannot run `edgedb` CLI to apply a migration")
-            .success());
+            .execute_and_print_errors(Some("edgedb CLI"), "apply a migration");
     }
 }
 
