@@ -1,7 +1,7 @@
 use std::{path::PathBuf, str::FromStr};
 
 use once_cell::sync::Lazy;
-use test_utils::server::ServerInstance;
+use test_utils::{cmd_execute::DebugCommand, server::ServerInstance};
 
 pub static SERVER: Lazy<ServerInstance> = Lazy::new(start);
 
@@ -22,12 +22,10 @@ fn test_01() {
     assert!(SERVER.version_major > 0);
     assert!(SERVER.info.port > 1000);
 
-    assert!(SERVER
+    SERVER
         .cli()
         .arg("query")
         .arg("--output-format=tab-separated")
         .arg("SELECT sys::get_current_database()")
-        .status()
-        .expect("cannot run edgedb CLI")
-        .success());
+        .execute_and_print_errors(None, "a simple query");
 }

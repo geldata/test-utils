@@ -1,13 +1,11 @@
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::process;
 use std::sync::Mutex;
 
 use anyhow::Context;
-use command_fds::{CommandFdExt, FdMapping};
 
 use crate::cmd_execute::DebugCommand;
 
@@ -41,20 +39,42 @@ impl ServerInstance {
         cmd.env("EDGEDB_SERVER_SECURITY", "insecure_dev_mode");
         cmd.arg("--temp-dir");
         cmd.arg("--testmode");
-        cmd.arg("--emit-server-status=fd://3");
         cmd.arg("--port=auto");
         cmd.arg("--tls-cert-mode=generate_self_signed");
 
-        // pipe server status on fd 3 into a reader bellow
-        let (status_read, status_write) = nix::unistd::pipe().unwrap();
-        cmd.fd_mappings(vec![FdMapping {
-            parent_fd: status_write,
-            child_fd: 3,
-        }])
-        .unwrap();
+        // pipe server status on into a reader
+        #[cfg(unix)]
+        let get_status_file = {
+            use command_fds::CommandFdExt;
 
-        // pipe stderr into a buffer that's printed only when there is an error
-        cmd.stderr(process::Stdio::piped());
+            let (status_read, status_write) = nix::unistd::pipe().unwrap();
+            cmd.arg("--emit-server-status=fd://3");
+            cmd.fd_mappings(vec![command_fds::FdMapping {
+                parent_fd: status_write,
+                child_fd: 3,
+            }])
+            .unwrap();
+            move || File::from(status_read)
+        };
+        #[cfg(not(unix))]
+        let get_status_file = {
+            let mut status_filepath = std::env::temp_dir();
+            status_filepath.push(format!(
+                "edgedb-server-status-{}.txt",
+                unique_test_run_identifier()
+            ));
+            cmd.arg(format!(
+                "--emit-server-status=file://{}",
+                status_filepath.as_os_str().to_string_lossy()
+            ));
+
+            move || loop {
+                match File::open(&status_filepath) {
+                    Ok(f) => break f,
+                    Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
+                }
+            }
+        };
 
         #[cfg(unix)]
         if nix::unistd::Uid::effective().as_raw() == 0 {
@@ -64,18 +84,21 @@ impl ServerInstance {
             cmd.uid(1);
         }
 
+        // pipe stderr into a buffer that's printed only when there is an error
+        cmd.stderr(process::Stdio::piped());
+
         eprintln!("Starting {}...", bin_name);
 
         let mut process = cmd
             .spawn()
-            .unwrap_or_else(|_| panic!("Can run {}", bin_name));
+            .unwrap_or_else(|_| panic!("Cannot run {}", bin_name));
 
         // write log file
         let stdout = process.stderr.take().unwrap();
         std::thread::spawn(move || write_log_into_file(stdout));
 
         // wait for server to start
-        let info = wait_for_server_status(status_read).unwrap();
+        let info = wait_for_server_status(get_status_file).unwrap();
 
         ServerInstance {
             info,
@@ -87,6 +110,7 @@ impl ServerInstance {
     pub fn cli(&self) -> process::Command {
         let mut cmd = process::Command::new("edgedb");
         cmd.arg("--no-cli-update-check");
+        cmd.arg("--admin");
         cmd.arg("--unix-path").arg(&self.info.socket_dir);
         cmd.arg("--port").arg(self.info.port.to_string());
         cmd.env("CLICOLOR", "0");
@@ -115,7 +139,7 @@ impl ServerInstance {
         {
             // This is suboptimal -- ideally we need to close the process
             // gracefully on Windows too.
-            if let Err(e) = proc.stop() {
+            if let Err(e) = process.kill() {
                 eprintln!("could not kill edgedb-server: {:?}", e);
             }
         }
@@ -132,11 +156,7 @@ impl ServerInstance {
 
         // copy schema dir to tmp so we don't pollute the committed dir
         let mut tmp_schema_dir = std::env::temp_dir();
-        let millis_since_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis();
-        tmp_schema_dir.push(format!("edgedb-dbschema-{millis_since_epoch}"));
+        tmp_schema_dir.push(format!("edgedb-dbschema-{}", unique_test_run_identifier()));
         std::fs::create_dir(&tmp_schema_dir).unwrap();
         fs_extra::dir::copy(
             schema_dir,
@@ -199,11 +219,12 @@ fn get_edgedb_server_version(bin_name: &str) -> u8 {
     major.parse::<u8>().unwrap()
 }
 
-/// Reads the stream at file descriptor `status_read` until edgedb-server notifies that it is ready
-fn wait_for_server_status(status_read: OwnedFd) -> anyhow::Result<ServerInfo> {
+/// Reads the stream of file `status_file` until edgedb-server notifies that it is ready
+fn wait_for_server_status(get_status_file: impl FnOnce() -> File) -> anyhow::Result<ServerInfo> {
     eprintln!("Reading status...");
 
-    let pipe = BufReader::new(File::from(status_read));
+    // try reading until a success
+    let pipe = BufReader::new(get_status_file());
     let mut result = Err(anyhow::anyhow!("no server info emitted"));
     for line in pipe.lines() {
         match line {
@@ -228,13 +249,10 @@ fn wait_for_server_status(status_read: OwnedFd) -> anyhow::Result<ServerInfo> {
 fn write_log_into_file(stream: impl std::io::Read) {
     let log_dir = env::temp_dir();
 
-    let millis_since_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_millis();
+    let id = unique_test_run_identifier();
 
     let mut log_file = log_dir.clone();
-    let file_name = format!("edgedb-server-{millis_since_epoch}.log").to_string();
+    let file_name = format!("edgedb-server-{id}.log").to_string();
     log_file.push(file_name);
 
     eprintln!("Writing server logs into {:?}", &log_file);
@@ -244,4 +262,12 @@ fn write_log_into_file(stream: impl std::io::Read) {
 
     let mut reader = BufReader::new(stream);
     std::io::copy(&mut reader, &mut log_file).unwrap();
+}
+
+fn unique_test_run_identifier() -> String {
+    let millis_since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis();
+    millis_since_epoch.to_string()
 }
