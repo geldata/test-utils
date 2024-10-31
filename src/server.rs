@@ -198,25 +198,22 @@ fn get_edgedb_server_version(bin_name: &str) -> u8 {
     let server_stdout = process.stdout.take().expect("stdout is pipe");
     let buf = BufReader::new(server_stdout);
 
-    let mut version_str = None;
-    for line in buf.lines() {
-        match line {
-            Ok(line) => {
-                if let Some(line) = line.strip_prefix("edgedb-server, version ") {
-                    version_str = Some(line.split('+').next().unwrap().to_string());
-                    break;
-                }
-            }
-            Err(e) => {
-                eprintln!("Error reading from server: {}", e);
-                break;
-            }
-        }
-    }
+    let err = "could not read server stdout";
+    let line = buf.lines().next().expect(err).expect(err);
+    let err = &format!("could not parse server version output: {}", line);
 
-    let version_str = version_str.unwrap();
-    let major = version_str.split('.').next().unwrap();
-    major.parse::<u8>().unwrap()
+    line
+        .strip_prefix("edgedb-server, version ")
+        .or_else(|| line.strip_prefix("gel-server, version "))
+        .expect(err)
+        .split('+')
+        .next()
+        .expect(err)
+        .split('.')
+        .next()
+        .expect(err)
+        .parse::<u8>()
+        .expect(err)
 }
 
 /// Reads the stream of file `status_file` until edgedb-server notifies that it is ready
