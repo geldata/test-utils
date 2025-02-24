@@ -1,6 +1,7 @@
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process;
 use std::sync::Mutex;
@@ -9,10 +10,20 @@ use anyhow::Context;
 
 use crate::cmd_execute::DebugCommand;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServerVersion {
+    Package(u8),
+    Dev,
+}
+
+#[derive(Debug)]
 pub struct ServerInstance {
     pub info: ServerInfo,
-    pub version_major: u8,
+    pub version_major: ServerVersion,
+    #[allow(dead_code)]
     process: Mutex<Option<process::Child>>,
+    #[cfg(unix)]
+    pid: nix::unistd::Pid,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -27,21 +38,55 @@ pub struct ServerInfo {
 
 impl ServerInstance {
     pub fn start() -> ServerInstance {
-        let bin_name = if let Ok(ver) = env::var("EDGEDB_MAJOR_VERSION") {
-            format!("edgedb-server-{}", ver)
+        let major_version = env::var("GEL_MAJOR_VERSION").or_else(|_| {
+            let var = env::var("EDGEDB_MAJOR_VERSION");
+            if var.is_ok() {
+                eprintln!("*** [DEPRECATION WARNING] GEL_MAJOR_VERSION is not set, trying EDGEDB_MAJOR_VERSION ***");
+            }
+            var
+        });
+
+        let bin_name = if let Ok(ver) = &major_version {
+            format!("gel-server-{}", ver)
         } else {
-            "edgedb-server".to_string()
+            "gel-server".to_string()
         };
 
-        let version_major = get_edgedb_server_version(&bin_name);
+        let version_major = match get_server_version(&bin_name) {
+            Ok(ver) => ver,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "*** [DEPRECATION WARNING] gel-server not found, trying edgedb-server ***"
+                );
+                let bin_name = if let Ok(ver) = &major_version {
+                    format!("edgedb-server-{}", ver)
+                } else {
+                    "edgedb-server".to_string()
+                };
+                get_server_version(&bin_name).context(format!("Cannot run get-server or edgedb-server (GEL_MAJOR_VERSION = {major_version:?})")).unwrap()
+            }
+            Err(e) => {
+                panic!("Cannot run get-server or edgedb-server (GEL_MAJOR_VERSION = {major_version:?}): {e:?}");
+            }
+        };
 
         let mut cmd = process::Command::new(&bin_name);
         cmd.env("EDGEDB_SERVER_SECURITY", "insecure_dev_mode");
+        if version_major == ServerVersion::Dev {
+            eprintln!("Running in dev mode");
+            cmd.env("__EDGEDB_DEVMODE", "1");
+        }
         cmd.arg("--temp-dir");
         cmd.arg("--testmode");
         cmd.arg("--port=auto");
         cmd.arg("--tls-cert-mode=generate_self_signed");
-
+        #[cfg(target_os = "linux")]
+        unsafe {
+            cmd.pre_exec(|| {
+                _ = nix::sys::prctl::set_pdeathsig(nix::sys::signal::SIGTERM);
+                Ok(())
+            });
+        }
         // pipe server status on into a reader
         #[cfg(unix)]
         let get_status_file = {
@@ -103,6 +148,7 @@ impl ServerInstance {
         ServerInstance {
             info,
             version_major,
+            pid: nix::unistd::Pid::from_raw(process.id() as i32),
             process: Mutex::new(Some(process)),
         }
     }
@@ -117,36 +163,36 @@ impl ServerInstance {
         cmd
     }
 
+    /// WARNING: This runs after Rust main and cannot use stdlib. The Windows code below is
+    /// probably buggy and/or unreliable.
     pub fn stop(&self) {
-        let Some(mut process) = self.process.lock().unwrap().take() else {
-            return;
-        };
-
-        eprintln!("Stopping...");
+        libc_print::libc_eprintln!("Stopping DB server process...");
 
         #[cfg(not(windows))]
         {
             use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
 
-            let pid = Pid::from_raw(process.id() as i32);
-            if let Err(e) = signal::kill(pid, Signal::SIGTERM) {
-                eprintln!("could not send SIGTERM to edgedb-server: {:?}", e);
+            if let Err(e) = signal::kill(self.pid, Signal::SIGTERM) {
+                libc_print::libc_eprintln!("could not send SIGTERM to edgedb-server: {:?}", e);
             };
+
+            let res = nix::sys::wait::waitpid(self.pid, None).expect("could not wait for edgedb-server to exit");
+            libc_print::libc_eprintln!("Stopped DB server process. Exit code: {:?}", res);
         }
 
         #[cfg(windows)]
         {
             // This is suboptimal -- ideally we need to close the process
             // gracefully on Windows too.
+            let Some(mut process) = self.process.lock().unwrap().take() else {
+                return;
+            };
+    
+            eprintln!("Stopping...");
             if let Err(e) = process.kill() {
                 eprintln!("could not kill edgedb-server: {:?}", e);
             }
         }
-
-        process.wait().ok();
-
-        eprintln!("Stopped.");
     }
 
     pub fn apply_schema(&self, schema_dir: &Path) {
@@ -186,34 +232,51 @@ impl ServerInstance {
     }
 }
 
-fn get_edgedb_server_version(bin_name: &str) -> u8 {
+fn get_server_version(bin_name: &str) -> std::io::Result<ServerVersion> {
     let mut cmd = process::Command::new(bin_name);
     cmd.arg("--version");
     cmd.stdout(process::Stdio::piped());
+    cmd.stderr(process::Stdio::piped());
 
-    let mut process = cmd
-        .spawn()
-        .with_context(|| format!("Cannot run executable {bin_name}"))
-        .unwrap();
+    let mut process = cmd.spawn()?;
     let server_stdout = process.stdout.take().expect("stdout is pipe");
+    let server_stderr = process.stderr.take().expect("stderr is pipe");
     let buf = BufReader::new(server_stdout);
+    let err = "could not read server stdout/stderr";
+    let mut lines = buf.lines().collect::<Result<Vec<_>, _>>().expect(err);
+    if lines.is_empty() {
+        lines = BufReader::new(server_stderr).lines().collect::<Result<Vec<_>, _>>().expect(err);
+    }
 
-    let err = "could not read server stdout";
-    let line = buf.lines().next().expect(err).expect(err);
-    let err = &format!("could not parse server version output: {}", line);
+    let version = get_server_version_from_lines(&lines);
+    Ok(version)
+}
 
-    line
-        .strip_prefix("edgedb-server, version ")
-        .or_else(|| line.strip_prefix("gel-server, version "))
-        .expect(err)
-        .split('+')
-        .next()
-        .expect(err)
-        .split('.')
-        .next()
-        .expect(err)
-        .parse::<u8>()
-        .expect(err)
+fn get_server_version_from_lines(lines: &[String]) -> ServerVersion {
+    if lines
+        .iter()
+        .any(|line| line.contains("edb.buildmeta.MetadataError"))
+    {
+        return ServerVersion::Dev;
+    }
+
+    let line = lines.iter().find(|line| line.contains(", version "));
+    if let Some(line) = line {
+        let (_, version) = line
+            .split_once(", version ")
+            .expect(&format!("could not split on ', version ': {:?}", line));
+        let version = version
+            .split('+')
+            .next()
+            .expect(&format!("could not split on '+': {:?}", line));
+        return ServerVersion::Package(
+            version
+                .parse::<u8>()
+                .expect(&format!("could not parse version: {:?}", line)),
+        );
+    }
+
+    panic!("could not parse server version output: {:?}", lines);
 }
 
 /// Reads the stream of file `status_file` until edgedb-server notifies that it is ready
@@ -267,4 +330,29 @@ fn unique_test_run_identifier() -> String {
         .expect("Time went backwards")
         .as_millis();
     millis_since_epoch.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_version() {
+        assert_eq!(
+            get_server_version_from_lines(&vec!["edgedb-server, version 1.0.0".to_string()]),
+            ServerVersion::Package(1)
+        );
+        assert_eq!(
+            get_server_version_from_lines(&vec!["gel-server, version 1.0.0".to_string()]),
+            ServerVersion::Package(1)
+        );
+        assert_eq!(get_server_version_from_lines(&vec!["gel-server, version 7.0-dev.9224+d2025022023.g01d049898.cv202502040000.r202502210133.tmfqxey3igy2c2ylqobwgkllemfzho2lo.bofficial.sd2c25f6".to_string()]), ServerVersion::Package(7));
+        assert_eq!(
+            get_server_version_from_lines(&vec![
+                "edb.buildmeta.MetadataError: could not find VERSION in Gel distribution metadata"
+                    .to_string()
+            ]),
+            ServerVersion::Dev
+        );
+    }
 }
