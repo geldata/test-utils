@@ -10,10 +10,16 @@ use anyhow::Context;
 
 use crate::cmd_execute::DebugCommand;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ServerVersion {
     Package(u8),
     Dev,
+}
+
+impl ServerVersion {
+    pub fn is_at_least(&self, version: u8) -> bool {
+        matches!(self, ServerVersion::Dev) || self.cmp(&ServerVersion::Package(version)) != std::cmp::Ordering::Less
+    }
 }
 
 #[derive(Debug)]
