@@ -147,6 +147,7 @@ impl ServerInstance {
         ServerInstance {
             info,
             version_major,
+            #[cfg(unix)]
             pid: nix::unistd::Pid::from_raw(process.id() as i32),
             process: Mutex::new(Some(process)),
         }
