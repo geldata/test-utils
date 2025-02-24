@@ -18,7 +18,8 @@ pub enum ServerVersion {
 
 impl ServerVersion {
     pub fn is_at_least(&self, version: u8) -> bool {
-        matches!(self, ServerVersion::Dev) || self.cmp(&ServerVersion::Package(version)) != std::cmp::Ordering::Less
+        matches!(self, ServerVersion::Dev)
+            || self.cmp(&ServerVersion::Package(version)) != std::cmp::Ordering::Less
     }
 }
 
@@ -86,13 +87,6 @@ impl ServerInstance {
         cmd.arg("--testmode");
         cmd.arg("--port=auto");
         cmd.arg("--tls-cert-mode=generate_self_signed");
-        #[cfg(target_os = "linux")]
-        unsafe {
-            cmd.pre_exec(|| {
-                _ = nix::sys::prctl::set_pdeathsig(nix::sys::signal::SIGTERM);
-                Ok(())
-            });
-        }
         // pipe server status on into a reader
         #[cfg(unix)]
         let get_status_file = {
@@ -182,7 +176,8 @@ impl ServerInstance {
                 libc_print::libc_eprintln!("could not send SIGTERM to edgedb-server: {:?}", e);
             };
 
-            let res = nix::sys::wait::waitpid(self.pid, None).expect("could not wait for edgedb-server to exit");
+            let res = nix::sys::wait::waitpid(self.pid, None)
+                .expect("could not wait for edgedb-server to exit");
             libc_print::libc_eprintln!("Stopped DB server process. Exit code: {:?}", res);
         }
 
@@ -193,7 +188,7 @@ impl ServerInstance {
             let Some(mut process) = self.process.lock().unwrap().take() else {
                 return;
             };
-    
+
             eprintln!("Stopping...");
             if let Err(e) = process.kill() {
                 eprintln!("could not kill edgedb-server: {:?}", e);
@@ -251,7 +246,10 @@ fn get_server_version(bin_name: &str) -> std::io::Result<ServerVersion> {
     let err = "could not read server stdout/stderr";
     let mut lines = buf.lines().collect::<Result<Vec<_>, _>>().expect(err);
     if lines.is_empty() {
-        lines = BufReader::new(server_stderr).lines().collect::<Result<Vec<_>, _>>().expect(err);
+        lines = BufReader::new(server_stderr)
+            .lines()
+            .collect::<Result<Vec<_>, _>>()
+            .expect(err);
     }
 
     let version = get_server_version_from_lines(&lines);

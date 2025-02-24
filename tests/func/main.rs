@@ -1,8 +1,8 @@
 use std::{path::PathBuf, str::FromStr};
 
+use dtor::dtor;
 use once_cell::sync::Lazy;
 use test_utils::{cmd_execute::DebugCommand, server::ServerInstance};
-use dtor::dtor;
 
 pub static SERVER: Lazy<ServerInstance> = Lazy::new(start);
 
