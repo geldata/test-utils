@@ -1,7 +1,6 @@
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process;
 use std::sync::Mutex;
@@ -270,9 +269,9 @@ fn get_server_version_from_lines(lines: &[String]) -> ServerVersion {
             .split_once(", version ")
             .expect(&format!("could not split on ', version ': {:?}", line));
         let version = version
-            .split('+')
+            .split(|c: char| !c.is_ascii_digit())
             .next()
-            .expect(&format!("could not split on '+': {:?}", line));
+            .expect(&format!("could not split on non-digit: {:?}", line));
         return ServerVersion::Package(
             version
                 .parse::<u8>()
