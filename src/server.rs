@@ -86,6 +86,8 @@ impl ServerInstance {
         cmd.arg("--testmode");
         cmd.arg("--port=auto");
         cmd.arg("--tls-cert-mode=generate_self_signed");
+        // try not to leave too many servers around
+        cmd.arg("--auto-shutdown-after=600");
         // pipe server status on into a reader
         #[cfg(unix)]
         let get_status_file = {
